@@ -16,7 +16,7 @@ from urllib3.exceptions import InsecureRequestWarning
 from prettytable import PrettyTable
 import time
 
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 REPO_URL = "https://github.com/verymoe/nginx-ssl-auto"
 AUTHOR = "Shiro"
 
@@ -50,7 +50,7 @@ def find_nginx_processes(debug: bool) -> List[Tuple[str, str]]:
                     nginx_processes.append((exe, conf_path))
                     if debug:
                         logger.debug(f"添加 Nginx 进程信息: 可执行文件={exe}, 配置文件={conf_path}")
-        
+
         if nginx_processes:
             logger.info(f"找到 {len(nginx_processes)} 个 Nginx 进程")
             for exe, conf in nginx_processes:
@@ -59,7 +59,7 @@ def find_nginx_processes(debug: bool) -> List[Tuple[str, str]]:
             logger.warning("未找到 Nginx 进程")
     except Exception as e:
         logger.error(f"查找 Nginx 进程时出错: {e}")
-    
+
     return nginx_processes
 
 def find_included_conf_files(main_conf_path: str, debug: bool) -> List[str]:
@@ -71,7 +71,7 @@ def find_included_conf_files(main_conf_path: str, debug: bool) -> List[str]:
 
     conf_files = [main_conf_path]
     dir_path = os.path.dirname(main_conf_path)
-    
+
     try:
         with open(main_conf_path, 'r') as f:
             for line in f:
@@ -85,7 +85,7 @@ def find_included_conf_files(main_conf_path: str, debug: bool) -> List[str]:
                         logger.debug(f"找到包含的配置文件: {included_files}")
     except Exception as e:
         logger.error(f"读取主配置文件时出错: {e}")
-    
+
     if debug:
         logger.debug(f"找到的所有配置文件: {conf_files}")
     return conf_files
@@ -116,17 +116,17 @@ def find_ssl_paths_and_hosts(conf_files: List[str], debug: bool) -> Dict[str, Di
                 content = f.read()
                 # 移除注释
                 content = re.sub(r'#.*$', '', content, flags=re.MULTILINE)
-                
+
                 # 在整个文件中查找SSL配置
                 ssl_certificate = re.findall(r'ssl_certificate\s+(.*?);', content)
                 ssl_certificate_key = re.findall(r'ssl_certificate_key\s+(.*?);', content)
                 server_name = re.findall(r'server_name\s+(.*?);', content)
-                
+
                 if ssl_certificate or ssl_certificate_key:
                     hosts = [host.strip() for host in server_name[0].split()] if server_name else []
                     cert_path = ssl_certificate[0] if ssl_certificate else None
                     expiry = get_cert_expiry(cert_path, debug) if cert_path else None
-                    
+
                     ssl_info[conf_file] = {
                         'ssl_certificate': ssl_certificate[0] if ssl_certificate else None,
                         'ssl_certificate_key': ssl_certificate_key[0] if ssl_certificate_key else None,
@@ -146,10 +146,10 @@ def get_cloud_certificates(api_token: str, api_user: str, debug: bool) -> List[D
     headers = {
         "Authorization": f"Bearer {api_token}:{api_user}"
     }
-    
+
     if debug:
         logger.debug(f"开始获取云证书，API URL: {url}")
-    
+
     try:
         response = requests.get(url, headers=headers, verify=False)
         response.raise_for_status()
@@ -173,15 +173,24 @@ def match_certificates(local_ssl_info: Dict[str, Dict], cloud_certs: List[Dict],
     matched_certs = []
     if debug:
         logger.debug("开始匹配本地证书和云证书")
+
     for conf_file, local_cert in local_ssl_info.items():
         matched_cloud_cert = None
         for cloud_cert in cloud_certs:
-            if set(local_cert['hosts']) & set(cloud_cert['domains']):
+            # if set(local_cert['hosts']) & set(cloud_cert['domains']):
+            #     matched_cloud_cert = cloud_cert
+            #     if debug:
+            #         logger.debug(f"本地证书 {conf_file} 与云证书 {cloud_cert['id']} 匹配")
+            #     break
+            # 使用更灵活的匹配方法，支持通配符域名
+            if any(match_domain(local_host, cloud_domain)
+                   for local_host in local_cert['hosts']
+                   for cloud_domain in cloud_cert['domains']):
                 matched_cloud_cert = cloud_cert
                 if debug:
                     logger.debug(f"本地证书 {conf_file} 与云证书 {cloud_cert['id']} 匹配")
                 break
-        
+
         matched_certs.append({
             'local_cert': {
                 'file': conf_file,
@@ -193,9 +202,15 @@ def match_certificates(local_ssl_info: Dict[str, Dict], cloud_certs: List[Dict],
             'cloud_cert': matched_cloud_cert,
             'expiry_match': local_cert['expiry'] == (matched_cloud_cert['time_end'] if matched_cloud_cert else None)
         })
+
     if debug:
         logger.debug(f"匹配结果: {matched_certs}")
     return matched_certs
+
+def match_domain(local_domain: str, cloud_domain: str) -> bool:
+    if cloud_domain.startswith('*.'):
+        return local_domain.endswith(cloud_domain[2:]) or local_domain == cloud_domain[2:]
+    return local_domain == cloud_domain
 
 def get_expected_action(cert: Dict, debug: bool) -> Tuple[str, str]:
     if debug:
@@ -204,12 +219,12 @@ def get_expected_action(cert: Dict, debug: bool) -> Tuple[str, str]:
         return "NO_REPLACE_NO_MATCH", "不替换：云端无匹配"
     if cert['cloud_cert']['status'] == 3 and cert['cloud_cert']['status_name'] == "验证中":
         return "NO_REPLACE_VALIDATING", "不替换：云端证书正在申请中"
-    
+
     local_expiry = datetime.datetime.strptime(cert['local_cert']['expiry'], '%Y-%m-%d %H:%M:%S UTC')
     cloud_expiry = datetime.datetime.strptime(cert['cloud_cert']['time_end'], '%Y-%m-%d %H:%M:%S')
-    
+
     time_difference = abs(cloud_expiry - local_expiry)
-    
+
     if time_difference < datetime.timedelta(hours=24):
         return "NO_REPLACE_SIMILAR", "不替换：有效期相差不到24小时"
     elif cloud_expiry < local_expiry:
@@ -226,14 +241,14 @@ def print_certificate_table(matched_certs: List[Dict], debug: bool):
     table.field_names = ["本地主机", "本地过期时间", "云端域名", "云端过期时间", "预期操作"]
     table.align = "l"
     table.max_width = 30
-    
+
     for i, cert in enumerate(matched_certs):
         local_hosts = ", ".join(cert['local_cert']['hosts'])
         local_expiry = cert['local_cert']['expiry']
         cloud_domains = ", ".join(cert['cloud_cert']['domains']) if cert['cloud_cert'] else "N/A"
         cloud_expiry = cert['cloud_cert']['time_end'] if cert['cloud_cert'] else "N/A"
         action, expected_action = get_expected_action(cert, debug)
-        
+
         # 根据预期操作添加强调符号
         if action == "REPLACE":
             expected_action = "✓ " + expected_action
@@ -250,7 +265,7 @@ def print_certificate_table(matched_certs: List[Dict], debug: bool):
 
         # 将预期操作拆分成多行，以确保不超出表格边界
         expected_action_lines = [expected_action[i:i+28] for i in range(0, len(expected_action), 28)]
-        
+
         # 添加第一行数据
         table.add_row([
             local_hosts,
@@ -259,15 +274,15 @@ def print_certificate_table(matched_certs: List[Dict], debug: bool):
             cloud_expiry,
             expected_action_lines[0]
         ])
-        
+
         # 如果预期操作有多行，添加剩余的行
         for line in expected_action_lines[1:]:
             table.add_row(["", "", "", "", "  " + line])  # 添加两个空格以对齐后续行
-        
+
         # 在每个证书之间添加空行，除了最后一个证书
         if i < len(matched_certs) - 1:
             table.add_row([""] * 5)
-    
+
     print(table)
     if debug:
         logger.debug("证书匹配表格已打印")
@@ -295,7 +310,7 @@ def restore_certificate(backup_path: str, cert_path: str, debug: bool) -> None:
 def replace_certificates(matched_certs: List[Dict], api_token: str, api_user: str, debug: bool) -> Tuple[bool, Dict[str, str]]:
     if debug:
         logger.debug("开始替换证书")
-    
+
     backup_dir = ensure_backup_dir(debug)
     backups = {}
     replaced = False
@@ -323,34 +338,34 @@ def replace_certificates(matched_certs: List[Dict], api_token: str, api_user: st
                 logger.debug(f"开始下载证书，URL: {cert_url}, 参数: {params}")
             response = requests.get(cert_url, headers=headers, params=params, verify=False)
             response.raise_for_status()
-            
+
             cert_data = response.json()
             if not cert_data['isOk']:
                 logger.error(f"下载证书失败: {cert_data.get('error', '未知错误')}")
                 if cert_data.get('error') == 'no auth':
                     logger.error("API 认证失败。请检查 API_TOKEN 和 API_USER 是否正确。")
                 continue
-            
+
             cert_content = cert_data['data']['cert']
             key_content = cert_data['data']['key']
-            
+
             if debug:
                 logger.debug(f"开始写入新的证书文件: {cert_path}")
             with open(cert_path, 'w') as f:
                 f.write(cert_content)
-            
+
             if debug:
                 logger.debug(f"开始写入新的密钥文件: {key_path}")
             with open(key_path, 'w') as f:
                 f.write(key_content)
-            
+
             logger.info(f"已替换 {', '.join(cert['local_cert']['hosts'])} 的证书。新的过期时间: {cert['cloud_cert']['time_end']}")
             replaced = True
         except requests.exceptions.RequestException as e:
             logger.error(f"API 请求失败: {e}")
         except Exception as e:
             logger.error(f"替换证书时出错: {e}")
-        
+
         if not replaced:
             # 如果出错，恢复备份
             if cert_path in backups:
@@ -380,14 +395,14 @@ def wait_for_nginx(nginx_bin: str, timeout: int = 30, debug: bool = False) -> bo
 def is_reload_needed(matched_certs: List[Dict], debug: bool) -> bool:
     if debug:
         logger.debug("正在检查是否需要重新加载 Nginx")
-    
+
     for cert in matched_certs:
         action, _ = get_expected_action(cert, debug)
         if action == "REPLACE":
             if debug:
                 logger.debug("需要重新加载：至少有一个证书将被替换")
             return True
-    
+
     if debug:
         logger.debug("无需重新加载：没有证书需要替换")
     return False
@@ -410,7 +425,7 @@ def reload_and_verify_nginx(nginx_processes, backups, debug):
         else:
             logger.warning("Nginx 重载后状态异常，正在尝试恢复备份...")
             restore_backups(backups, debug)
-            
+
             # 再次尝试重载
             reload_nginx(nginx_bin, debug)
             if wait_for_nginx(nginx_bin, debug=debug):
